@@ -307,12 +307,26 @@ def _remove_worktree(worktree_path: str, branch_name: str) -> bool:
 
 
 def _get_pid_start_time(pid: int) -> Optional[float]:
-    """Get process start time from /proc (Linux). Returns None if unavailable."""
+    """Get process start time: /proc on Linux, `ps -o lstart=` elsewhere (macOS).
+
+    Returns None if unavailable. Without the ps fallback the PID-reuse guard in
+    _is_alive is a no-op on macOS, so a long-lived server could report (and
+    codex_cancel could signal) an unrelated process that inherited the PID.
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         # Field 22 (0-indexed: 21) is starttime in clock ticks
         fields = stat.rsplit(")", 1)[-1].split()
         return float(fields[19])  # index 19 after the closing paren
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout.strip()
+        return time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y")) if out else None
     except Exception:
         return None
 
@@ -2186,6 +2200,363 @@ def _cancel_task(task_id: str) -> Dict[str, Any]:
 # Request handler
 # ===================================================================
 
+def _call_tool(
+    tool: Any,
+    args: Dict[str, Any],
+    request_id: Any = None,
+    progress_token: Any = None,
+) -> Dict[str, Any]:
+    """Run one tools/call and return {"result": ...} or {"error": ...}.
+
+    Transport-neutral so the stdio loop and the shared HTTP service
+    (codex_swarm_http) dispatch through the same code.
+    """
+
+    if tool == "codex":
+        args.pop("timeout", None)  # ignored: sync tools run to completion
+        result, thread_id, worktree_info = _run_sync(
+            args,
+            request_id=request_id,
+            progress_token=progress_token,
+        )
+        text = result
+        details = []
+        if thread_id:
+            details.append(
+                f"Thread ID: {thread_id}\nUse codex_reply(threadId=\"{thread_id}\", prompt=\"...\") to continue this session."
+            )
+        if worktree_info:
+            details.append(
+                f"Worktree Path: {worktree_info['worktree_path']}\n"
+                f"Worktree Branch: {worktree_info['worktree_branch']}"
+            )
+        if details:
+            text += f"\n\n---\n" + "\n\n---\n".join(details)
+        return {
+            "result": {"content": [{"type": "text", "text": text}]},
+        }
+
+    elif tool == "codex_async":
+        launch_info = _start_async(args)
+        task_id = launch_info["task_id"]
+        lines = [
+            f"Codex task {task_id} started.",
+        ]
+        if launch_info.get("worktree_path"):
+            lines.append(f"Worktree Path: {launch_info['worktree_path']}")
+        if launch_info.get("worktree_branch"):
+            lines.append(f"Worktree Branch: {launch_info['worktree_branch']}")
+        # This warning exists because the old wording ("started in
+        # background") read exactly like the MCP client's own backgrounded
+        # tool calls, which DO notify on completion. A session conflated the
+        # two, ended its turn, and never collected a finished result.
+        lines.extend([
+            "",
+            "NOT TRACKED BY YOUR CLIENT. This id is internal to "
+            "codex-swarm. No completion notification will arrive and "
+            "nothing will wake this session when the task finishes.",
+            "",
+            f'You MUST call codex_wait(task_ids=["{task_id}"]) before this '
+            "turn ends, or the result is stranded on disk with nobody to "
+            "collect it. codex_wait is the call your client tracks and the "
+            "only thing that brings the answer back.",
+            "",
+            f'codex_status(task_ids=["{task_id}"]) is a progress peek only. '
+            "It does not collect the result and it does not keep the "
+            "session alive.",
+        ])
+        return {
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "\n".join(lines),
+                }],
+            },
+        }
+
+    elif tool == "codex_reply":
+        thread_id = args.get("threadId")
+        prompt = args.get("prompt")
+
+        if not thread_id or not prompt:
+            return {
+                "error": {
+                    "code": -32602,
+                    "message": "threadId and prompt are required",
+                },
+            }
+
+        text, _ = _run_reply_sync(
+            thread_id, prompt, request_id=request_id, progress_token=progress_token
+        )
+        return {
+            "result": {"content": [{"type": "text", "text": text}]},
+        }
+
+    elif tool == "codex_status":
+        task_ids = args.get("task_ids", [])
+        if not task_ids:
+            return {
+                "error": {"code": -32602, "message": "task_ids is required"},
+            }
+
+        parts = []
+        for tid in task_ids:
+            state = _resolve_task_state(tid)
+            status = state["status"]
+
+            if status in ("error", "not_found"):
+                parts.append(f"=== Task {tid} === {state.get('error', status).upper()}")
+                continue
+
+            elapsed = state["elapsed_seconds"]
+            stdout_path = TASK_DIR / f"{tid}.stdout"
+            stderr_path = TASK_DIR / f"{tid}.stderr"
+            stdout_text = _safe_read(stdout_path)
+            jsonl_status = _parse_jsonl_status(stdout_path)
+
+            if status == "running":
+                lines = [f"=== Task {tid} ({elapsed}s elapsed) ==="]
+            elif status == "failed":
+                exit_code = state.get("exit_code")
+                if exit_code is None:
+                    exit_code = "?"
+                lines = [f"=== Task {tid} (FAILED in {elapsed}s, exit {exit_code}) ==="]
+                if state.get("status_inferred"):
+                    lines.append(_UNVERIFIED_FAILURE_HINT)
+            elif status == "cancelled":
+                lines = [f"=== Task {tid} (CANCELLED after {elapsed}s) ==="]
+            else:
+                lines = [f"=== Task {tid} (COMPLETED in {elapsed}s) ==="]
+                if state.get("status_inferred"):
+                    lines.append(_UNVERIFIED_COMPLETION_HINT)
+
+            # Surface thread_id from meta or stdout
+            meta = state.get("meta", {})
+            tid_thread = meta.get("thread_id")
+            if not tid_thread and stdout_text:
+                _, tid_thread = _extract_from_jsonl(stdout_text)
+            if tid_thread:
+                lines.append(f"Thread ID: {tid_thread}")
+            if meta.get("worktree_path"):
+                lines.append(f"Worktree: {meta['worktree_path']}")
+            if meta.get("worktree_branch"):
+                lines.append(f"Branch: {meta['worktree_branch']}")
+
+            display_phase = (
+                status
+                if status in ("completed", "failed", "cancelled")
+                else jsonl_status["phase"]
+            )
+            lines.append(f"Phase: {display_phase}")
+            lines.append(f"Tools called: {jsonl_status['tools_called']}")
+
+            if status == "failed":
+                failure = _build_failure_info(
+                    stdout_text,
+                    _safe_read(stderr_path),
+                    command=meta.get("command"),
+                )
+                lines.extend(
+                    _format_failure_info(failure).splitlines()
+                )
+            elif status == "running" and jsonl_status["last_error"]:
+                observed = _classify_failure(jsonl_status["last_error"])
+                retryable = observed.get("retryable")
+                retryable_text = (
+                    "yes"
+                    if retryable is True
+                    else "no"
+                    if retryable is False
+                    else "unknown"
+                )
+                lines.append(
+                    "Error observed (non-terminal; process still running): "
+                    f"{jsonl_status['last_error'][:300]}"
+                )
+                lines.append(f"Category: {observed['category']}")
+                lines.append(
+                    "Retryable: "
+                    f"{retryable_text} (informational only; the wrapper did not retry)"
+                )
+
+            if jsonl_status["last_warning"]:
+                lines.append(f"Warning: {jsonl_status['last_warning'][:300]}")
+
+            if jsonl_status["terminal_conflict"]:
+                lines.append(
+                    "Terminal signals conflicted; lifecycle state used the process exit code."
+                )
+
+            if jsonl_status["last_tool"]:
+                tool_info = jsonl_status["last_tool"]
+                if jsonl_status["last_tool_args"]:
+                    tool_info += f"({jsonl_status['last_tool_args'][:120]})"
+                lines.append(f"Last tool: {tool_info}")
+
+            if jsonl_status["last_reasoning"]:
+                lines.append(
+                    f"Thinking: {jsonl_status['last_reasoning'][:200]}"
+                )
+
+            if jsonl_status["last_assistant_text"]:
+                output_label = (
+                    "Partial output (before failure)"
+                    if status == "failed"
+                    else "Output"
+                )
+                lines.append(
+                    f"{output_label}: {jsonl_status['last_assistant_text'][:300]}"
+                )
+
+            parts.append("\n".join(lines))
+
+        return {
+            "result": {
+                "content": [{"type": "text", "text": "\n\n".join(parts)}],
+            },
+        }
+
+    elif tool == "codex_wait":
+        task_ids = args.get("task_ids", [])
+        timeout = args.get("timeout", 1800)
+
+        if not task_ids:
+            return {
+                "error": {"code": -32602, "message": "task_ids is required"},
+            }
+
+        # Raise short waits past the client's backgrounding threshold.
+        # Callers pick values like 110 or 115 specifically to return before
+        # the client backgrounds the call, which is exactly backwards: the
+        # backgrounded call is the one whose completion re-invokes the
+        # session. Ducking under it converts a guaranteed wake-up into a
+        # promise the model has to remember to keep. Finished tasks are
+        # unaffected -- they resolve before the deadline is consulted.
+        # `timeout: null` is left alone deliberately: that means "no
+        # deadline", which already outlives the threshold.
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+            if timeout < _WAIT_MIN_TIMEOUT:
+                logging.info(
+                    "Raising codex_wait timeout %ss -> %ss to cross the "
+                    "client's %ss auto-background threshold",
+                    timeout, _WAIT_MIN_TIMEOUT, _CLIENT_AUTO_BACKGROUND_S,
+                )
+                timeout = _WAIT_MIN_TIMEOUT
+
+        results = _wait_tasks(
+            task_ids,
+            timeout=timeout,
+            request_id=request_id,
+            progress_token=progress_token,
+        )
+
+        parts = []
+        for tid in task_ids:
+            info = results.get(tid, {"status": "unknown"})
+            if info["status"] == "completed":
+                header = (
+                    f"=== Task {tid} (completed in "
+                    f"{info['elapsed_seconds']}s) ==="
+                )
+                thread_id = info.get("thread_id")
+                if thread_id:
+                    header += f"\nThread ID: {thread_id}"
+                if info.get("worktree_path"):
+                    header += f"\nWorktree: {info['worktree_path']}"
+                if info.get("worktree_branch"):
+                    header += f"\nBranch: {info['worktree_branch']}"
+                detail = info["result"]
+                if info.get("status_inferred"):
+                    detail = f"{_UNVERIFIED_COMPLETION_HINT}\n\n{detail}"
+                parts.append(f"{header}\n{detail}")
+            elif info["status"] == "failed":
+                exit_code = info.get("exit_code")
+                if exit_code is None:
+                    exit_code = "?"
+                header = (
+                    f"=== Task {tid} (FAILED in "
+                    f"{info['elapsed_seconds']}s, exit {exit_code}) ==="
+                )
+                if info.get("worktree_path"):
+                    header += f"\nWorktree: {info['worktree_path']}"
+                if info.get("worktree_branch"):
+                    header += f"\nBranch: {info['worktree_branch']}"
+                detail = info.get("failure_detail") or (
+                    "Model: unknown\n"
+                    f"Cause: {info.get('failure_cause', 'Unknown Codex failure')}"
+                )
+                if info.get("partial_output"):
+                    detail += (
+                        "\n\nPartial output (before failure): "
+                        f"{info['partial_output'][:300]}"
+                    )
+                if info.get("status_inferred"):
+                    detail = f"{_UNVERIFIED_FAILURE_HINT}\n\n{detail}"
+                parts.append(f"{header}\n{detail}")
+            elif info["status"] == "cancelled":
+                header = (
+                    f"=== Task {tid} (CANCELLED after "
+                    f"{info['elapsed_seconds']}s) ==="
+                )
+                if info.get("worktree_path"):
+                    header += f"\nWorktree: {info['worktree_path']}"
+                if info.get("worktree_branch"):
+                    header += f"\nBranch: {info['worktree_branch']}"
+                detail = info.get("result", "Task was cancelled")
+                parts.append(f"{header}\n{detail}")
+            elif info["status"] == "timeout":
+                header = (
+                    f"=== Task {tid} === STILL RUNNING (wait timed out, "
+                    f"task is NOT killed -- call codex_wait again to "
+                    f"resume waiting)"
+                )
+                if info.get("worktree_path"):
+                    header += f"\nWorktree: {info['worktree_path']}"
+                if info.get("worktree_branch"):
+                    header += f"\nBranch: {info['worktree_branch']}"
+                parts.append(f"{header}\n{_STILL_RUNNING_HINT}")
+            else:
+                header = (
+                    f"=== Task {tid} === "
+                    f"{info.get('error', info['status'])}"
+                )
+                if info.get("worktree_path"):
+                    header += f"\nWorktree: {info['worktree_path']}"
+                if info.get("worktree_branch"):
+                    header += f"\nBranch: {info['worktree_branch']}"
+                parts.append(header)
+
+        return {
+            "result": {
+                "content": [{"type": "text", "text": "\n\n".join(parts)}],
+            },
+        }
+
+    elif tool == "codex_cancel":
+        task_id = args.get("task_id")
+        if not task_id:
+            return {
+                "error": {"code": -32602, "message": "task_id is required"},
+            }
+
+        result = _cancel_task(task_id)
+        lines = [f"Task {task_id}: {result.get('message', result.get('error', result['status']))}"]
+        if result.get("worktree_path"):
+            lines.append(f"Worktree preserved: {result['worktree_path']}")
+        if result.get("worktree_branch"):
+            lines.append(f"Branch preserved: {result['worktree_branch']}")
+        if result.get("failure_detail"):
+            lines.extend(["", result["failure_detail"]])
+        return {
+            "result": {
+                "content": [{"type": "text", "text": "\n".join(lines)}],
+            },
+        }
+
+    return {"error": {"code": -32601, "message": f"Unknown tool: {tool}"}}
+
+
 def _handle(request: Dict[str, Any]) -> None:
     method = request.get("method")
     rid = request.get("id")
@@ -2264,384 +2635,11 @@ def _handle(request: Dict[str, Any]) -> None:
         return
 
     if method == "tools/call":
-        tool = params.get("name")
-        args = params.get("arguments", {})
         # Clients that want progress supply a token here; without one the
         # heartbeat is a no-op and long sync runs stay silent as before.
         progress_token = (params.get("_meta") or {}).get("progressToken")
-
-        if tool == "codex":
-            args.pop("timeout", None)  # ignored: sync tools run to completion
-            result, thread_id, worktree_info = _run_sync(
-                args,
-                request_id=rid,
-                progress_token=progress_token,
-            )
-            text = result
-            details = []
-            if thread_id:
-                details.append(
-                    f"Thread ID: {thread_id}\nUse codex_reply(threadId=\"{thread_id}\", prompt=\"...\") to continue this session."
-                )
-            if worktree_info:
-                details.append(
-                    f"Worktree Path: {worktree_info['worktree_path']}\n"
-                    f"Worktree Branch: {worktree_info['worktree_branch']}"
-                )
-            if details:
-                text += f"\n\n---\n" + "\n\n---\n".join(details)
-            _send({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {"content": [{"type": "text", "text": text}]},
-            })
-
-        elif tool == "codex_async":
-            launch_info = _start_async(args)
-            task_id = launch_info["task_id"]
-            lines = [
-                f"Codex task {task_id} started.",
-            ]
-            if launch_info.get("worktree_path"):
-                lines.append(f"Worktree Path: {launch_info['worktree_path']}")
-            if launch_info.get("worktree_branch"):
-                lines.append(f"Worktree Branch: {launch_info['worktree_branch']}")
-            # This warning exists because the old wording ("started in
-            # background") read exactly like the MCP client's own backgrounded
-            # tool calls, which DO notify on completion. A session conflated the
-            # two, ended its turn, and never collected a finished result.
-            lines.extend([
-                "",
-                "NOT TRACKED BY YOUR CLIENT. This id is internal to "
-                "codex-swarm. No completion notification will arrive and "
-                "nothing will wake this session when the task finishes.",
-                "",
-                f'You MUST call codex_wait(task_ids=["{task_id}"]) before this '
-                "turn ends, or the result is stranded on disk with nobody to "
-                "collect it. codex_wait is the call your client tracks and the "
-                "only thing that brings the answer back.",
-                "",
-                f'codex_status(task_ids=["{task_id}"]) is a progress peek only. '
-                "It does not collect the result and it does not keep the "
-                "session alive.",
-            ])
-            _send({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {
-                    "content": [{
-                        "type": "text",
-                        "text": "\n".join(lines),
-                    }],
-                },
-            })
-
-        elif tool == "codex_reply":
-            thread_id = args.get("threadId")
-            prompt = args.get("prompt")
-
-            if not thread_id or not prompt:
-                _send({
-                    "jsonrpc": "2.0",
-                    "id": rid,
-                    "error": {
-                        "code": -32602,
-                        "message": "threadId and prompt are required",
-                    },
-                })
-                return
-
-            text, _ = _run_reply_sync(
-                thread_id, prompt, request_id=rid, progress_token=progress_token
-            )
-            _send({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {"content": [{"type": "text", "text": text}]},
-            })
-
-        elif tool == "codex_status":
-            task_ids = args.get("task_ids", [])
-            if not task_ids:
-                _send({
-                    "jsonrpc": "2.0",
-                    "id": rid,
-                    "error": {"code": -32602, "message": "task_ids is required"},
-                })
-                return
-
-            parts = []
-            for tid in task_ids:
-                state = _resolve_task_state(tid)
-                status = state["status"]
-
-                if status in ("error", "not_found"):
-                    parts.append(f"=== Task {tid} === {state.get('error', status).upper()}")
-                    continue
-
-                elapsed = state["elapsed_seconds"]
-                stdout_path = TASK_DIR / f"{tid}.stdout"
-                stderr_path = TASK_DIR / f"{tid}.stderr"
-                stdout_text = _safe_read(stdout_path)
-                jsonl_status = _parse_jsonl_status(stdout_path)
-
-                if status == "running":
-                    lines = [f"=== Task {tid} ({elapsed}s elapsed) ==="]
-                elif status == "failed":
-                    exit_code = state.get("exit_code")
-                    if exit_code is None:
-                        exit_code = "?"
-                    lines = [f"=== Task {tid} (FAILED in {elapsed}s, exit {exit_code}) ==="]
-                    if state.get("status_inferred"):
-                        lines.append(_UNVERIFIED_FAILURE_HINT)
-                elif status == "cancelled":
-                    lines = [f"=== Task {tid} (CANCELLED after {elapsed}s) ==="]
-                else:
-                    lines = [f"=== Task {tid} (COMPLETED in {elapsed}s) ==="]
-                    if state.get("status_inferred"):
-                        lines.append(_UNVERIFIED_COMPLETION_HINT)
-
-                # Surface thread_id from meta or stdout
-                meta = state.get("meta", {})
-                tid_thread = meta.get("thread_id")
-                if not tid_thread and stdout_text:
-                    _, tid_thread = _extract_from_jsonl(stdout_text)
-                if tid_thread:
-                    lines.append(f"Thread ID: {tid_thread}")
-                if meta.get("worktree_path"):
-                    lines.append(f"Worktree: {meta['worktree_path']}")
-                if meta.get("worktree_branch"):
-                    lines.append(f"Branch: {meta['worktree_branch']}")
-
-                display_phase = (
-                    status
-                    if status in ("completed", "failed", "cancelled")
-                    else jsonl_status["phase"]
-                )
-                lines.append(f"Phase: {display_phase}")
-                lines.append(f"Tools called: {jsonl_status['tools_called']}")
-
-                if status == "failed":
-                    failure = _build_failure_info(
-                        stdout_text,
-                        _safe_read(stderr_path),
-                        command=meta.get("command"),
-                    )
-                    lines.extend(
-                        _format_failure_info(failure).splitlines()
-                    )
-                elif status == "running" and jsonl_status["last_error"]:
-                    observed = _classify_failure(jsonl_status["last_error"])
-                    retryable = observed.get("retryable")
-                    retryable_text = (
-                        "yes"
-                        if retryable is True
-                        else "no"
-                        if retryable is False
-                        else "unknown"
-                    )
-                    lines.append(
-                        "Error observed (non-terminal; process still running): "
-                        f"{jsonl_status['last_error'][:300]}"
-                    )
-                    lines.append(f"Category: {observed['category']}")
-                    lines.append(
-                        "Retryable: "
-                        f"{retryable_text} (informational only; the wrapper did not retry)"
-                    )
-
-                if jsonl_status["last_warning"]:
-                    lines.append(f"Warning: {jsonl_status['last_warning'][:300]}")
-
-                if jsonl_status["terminal_conflict"]:
-                    lines.append(
-                        "Terminal signals conflicted; lifecycle state used the process exit code."
-                    )
-
-                if jsonl_status["last_tool"]:
-                    tool_info = jsonl_status["last_tool"]
-                    if jsonl_status["last_tool_args"]:
-                        tool_info += f"({jsonl_status['last_tool_args'][:120]})"
-                    lines.append(f"Last tool: {tool_info}")
-
-                if jsonl_status["last_reasoning"]:
-                    lines.append(
-                        f"Thinking: {jsonl_status['last_reasoning'][:200]}"
-                    )
-
-                if jsonl_status["last_assistant_text"]:
-                    output_label = (
-                        "Partial output (before failure)"
-                        if status == "failed"
-                        else "Output"
-                    )
-                    lines.append(
-                        f"{output_label}: {jsonl_status['last_assistant_text'][:300]}"
-                    )
-
-                parts.append("\n".join(lines))
-
-            _send({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {
-                    "content": [{"type": "text", "text": "\n\n".join(parts)}],
-                },
-            })
-
-        elif tool == "codex_wait":
-            task_ids = args.get("task_ids", [])
-            timeout = args.get("timeout", 1800)
-
-            if not task_ids:
-                _send({
-                    "jsonrpc": "2.0",
-                    "id": rid,
-                    "error": {"code": -32602, "message": "task_ids is required"},
-                })
-                return
-
-            # Raise short waits past the client's backgrounding threshold.
-            # Callers pick values like 110 or 115 specifically to return before
-            # the client backgrounds the call, which is exactly backwards: the
-            # backgrounded call is the one whose completion re-invokes the
-            # session. Ducking under it converts a guaranteed wake-up into a
-            # promise the model has to remember to keep. Finished tasks are
-            # unaffected -- they resolve before the deadline is consulted.
-            # `timeout: null` is left alone deliberately: that means "no
-            # deadline", which already outlives the threshold.
-            if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
-                if timeout < _WAIT_MIN_TIMEOUT:
-                    logging.info(
-                        "Raising codex_wait timeout %ss -> %ss to cross the "
-                        "client's %ss auto-background threshold",
-                        timeout, _WAIT_MIN_TIMEOUT, _CLIENT_AUTO_BACKGROUND_S,
-                    )
-                    timeout = _WAIT_MIN_TIMEOUT
-
-            results = _wait_tasks(
-                task_ids,
-                timeout=timeout,
-                request_id=rid,
-                progress_token=progress_token,
-            )
-
-            parts = []
-            for tid in task_ids:
-                info = results.get(tid, {"status": "unknown"})
-                if info["status"] == "completed":
-                    header = (
-                        f"=== Task {tid} (completed in "
-                        f"{info['elapsed_seconds']}s) ==="
-                    )
-                    thread_id = info.get("thread_id")
-                    if thread_id:
-                        header += f"\nThread ID: {thread_id}"
-                    if info.get("worktree_path"):
-                        header += f"\nWorktree: {info['worktree_path']}"
-                    if info.get("worktree_branch"):
-                        header += f"\nBranch: {info['worktree_branch']}"
-                    detail = info["result"]
-                    if info.get("status_inferred"):
-                        detail = f"{_UNVERIFIED_COMPLETION_HINT}\n\n{detail}"
-                    parts.append(f"{header}\n{detail}")
-                elif info["status"] == "failed":
-                    exit_code = info.get("exit_code")
-                    if exit_code is None:
-                        exit_code = "?"
-                    header = (
-                        f"=== Task {tid} (FAILED in "
-                        f"{info['elapsed_seconds']}s, exit {exit_code}) ==="
-                    )
-                    if info.get("worktree_path"):
-                        header += f"\nWorktree: {info['worktree_path']}"
-                    if info.get("worktree_branch"):
-                        header += f"\nBranch: {info['worktree_branch']}"
-                    detail = info.get("failure_detail") or (
-                        "Model: unknown\n"
-                        f"Cause: {info.get('failure_cause', 'Unknown Codex failure')}"
-                    )
-                    if info.get("partial_output"):
-                        detail += (
-                            "\n\nPartial output (before failure): "
-                            f"{info['partial_output'][:300]}"
-                        )
-                    if info.get("status_inferred"):
-                        detail = f"{_UNVERIFIED_FAILURE_HINT}\n\n{detail}"
-                    parts.append(f"{header}\n{detail}")
-                elif info["status"] == "cancelled":
-                    header = (
-                        f"=== Task {tid} (CANCELLED after "
-                        f"{info['elapsed_seconds']}s) ==="
-                    )
-                    if info.get("worktree_path"):
-                        header += f"\nWorktree: {info['worktree_path']}"
-                    if info.get("worktree_branch"):
-                        header += f"\nBranch: {info['worktree_branch']}"
-                    detail = info.get("result", "Task was cancelled")
-                    parts.append(f"{header}\n{detail}")
-                elif info["status"] == "timeout":
-                    header = (
-                        f"=== Task {tid} === STILL RUNNING (wait timed out, "
-                        f"task is NOT killed -- call codex_wait again to "
-                        f"resume waiting)"
-                    )
-                    if info.get("worktree_path"):
-                        header += f"\nWorktree: {info['worktree_path']}"
-                    if info.get("worktree_branch"):
-                        header += f"\nBranch: {info['worktree_branch']}"
-                    parts.append(f"{header}\n{_STILL_RUNNING_HINT}")
-                else:
-                    header = (
-                        f"=== Task {tid} === "
-                        f"{info.get('error', info['status'])}"
-                    )
-                    if info.get("worktree_path"):
-                        header += f"\nWorktree: {info['worktree_path']}"
-                    if info.get("worktree_branch"):
-                        header += f"\nBranch: {info['worktree_branch']}"
-                    parts.append(header)
-
-            _send({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {
-                    "content": [{"type": "text", "text": "\n\n".join(parts)}],
-                },
-            })
-
-        elif tool == "codex_cancel":
-            task_id = args.get("task_id")
-            if not task_id:
-                _send({
-                    "jsonrpc": "2.0",
-                    "id": rid,
-                    "error": {"code": -32602, "message": "task_id is required"},
-                })
-                return
-
-            result = _cancel_task(task_id)
-            lines = [f"Task {task_id}: {result.get('message', result.get('error', result['status']))}"]
-            if result.get("worktree_path"):
-                lines.append(f"Worktree preserved: {result['worktree_path']}")
-            if result.get("worktree_branch"):
-                lines.append(f"Branch preserved: {result['worktree_branch']}")
-            if result.get("failure_detail"):
-                lines.extend(["", result["failure_detail"]])
-            _send({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {
-                    "content": [{"type": "text", "text": "\n".join(lines)}],
-                },
-            })
-
-        else:
-            _send({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "error": {"code": -32601, "message": f"Unknown tool: {tool}"},
-            })
+        out = _call_tool(params.get("name"), params.get("arguments", {}), rid, progress_token)
+        _send({"jsonrpc": "2.0", "id": rid, **out})
         return
 
     _send({
