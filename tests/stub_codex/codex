@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Stand-in for `codex exec`: emits the JSONL shape _analyze_jsonl reads. `sleep:N` in the prompt sleeps."""
+import json
+import os
+import re
+import sys
+import time
+
+argv = sys.argv[1:]
+prompt = argv[-1] if argv else ""
+m = re.search(r"sleep:(\d+)", prompt)
+if m:
+    time.sleep(int(m.group(1)))
+resume = len(argv) > 1 and argv[1] == "resume"
+print(json.dumps({"type": "thread.started", "thread_id": "stub-thread"}), flush=True)
+print(json.dumps({"type": "turn.started"}), flush=True)
+text = f"STUB cwd={os.getcwd()} resume={resume} argv={json.dumps(argv)}"
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}}), flush=True)
+print(json.dumps({"type": "turn.completed"}), flush=True)
