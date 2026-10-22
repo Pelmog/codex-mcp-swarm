@@ -159,3 +159,15 @@ def test_cleanup_thread_runs(monkeypatch):
     h._start_cleanup_thread(interval=0.1)
     time.sleep(0.35)
     assert len(calls) >= 2
+
+
+def test_one_wait_on_many_running_ids_respects_cap(url, tmp_path):
+    ids = [task_id_of(call(url, "codex_async", {"prompt": "sleep:30", "cwd": str(tmp_path)})) for _ in range(3)]
+    try:
+        start = time.time()
+        out = text(call(url, "codex_wait", {"task_ids": ids}))
+        assert time.time() - start < 6  # one deadline per call, not per task
+        assert out.count("STILL RUNNING") == 3
+    finally:
+        for i in ids:
+            call(url, "codex_cancel", {"task_id": i})
