@@ -112,6 +112,8 @@ def add_http(scope: str, cwd: Path) -> None:
     # add-json, not `add -H`: -H is variadic and swallows the name and URL.
     token = TOKEN.read_text().strip()
     entry = {"type": "http", "url": URL, "headers": {"Authorization": f"Bearer {token}"}}
+    # Replace any existing entry in this scope (re-runs after --rotate-token).
+    subprocess.run(["claude", "mcp", "remove", "-s", scope, "codex"], cwd=cwd, capture_output=True)
     claude("add-json", "-s", scope, "codex", json.dumps(entry), cwd=cwd)
 
 
@@ -123,9 +125,12 @@ def switch(scope: str) -> None:
         print(f"local-scope `codex` -> {URL} for new sessions in {REPO}")
         return
     entry = json.loads((HOME / ".claude.json").read_text())["mcpServers"]["codex"]
-    assert entry.get("type", "stdio") == "stdio", "user-scope codex is not the stdio entry; already switched?"
-    secure_write(BACKUP, json.dumps(entry, indent=2).encode())
-    claude("remove", "-s", "user", "codex")
+    if entry.get("type") == "http" and entry.get("url") == URL:
+        assert BACKUP.exists(), f"already on HTTP but no stdio backup at {BACKUP}"
+        # Re-run after --rotate-token: refresh the token, keep the original stdio backup.
+    else:
+        assert entry.get("type", "stdio") == "stdio", f"unexpected user-scope codex entry: {entry.get('type')}"
+        secure_write(BACKUP, json.dumps(entry, indent=2).encode())
     add_http("user", HOME)
     print(f"user-scope `codex` -> {URL}; stdio entry saved to {BACKUP}. Existing sessions keep their stdio copies.")
 
