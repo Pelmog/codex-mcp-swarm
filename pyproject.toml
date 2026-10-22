@@ -3,12 +3,12 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codex-mcp-swarm"
-version = "1.11.1"
-description = "Parallel Codex MCP server with live task monitoring, batch wait, and full flag parity"
+name = "codex-mcp-swarm-http"
+version = "1.11.1.post1"
+description = "codex-mcp-swarm as one shared, stateless Streamable HTTP MCP service"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 authors = [
     {name = "TKasperczyk"},
 ]
@@ -19,7 +19,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = []
+dependencies = ["mcp>=2.3,<3", "uvicorn>=0.30"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "httpx>=0.27"]
 
 [project.urls]
 Homepage = "https://github.com/TKasperczyk/codex-mcp-swarm"
@@ -27,7 +30,7 @@ Repository = "https://github.com/TKasperczyk/codex-mcp-swarm"
 Issues = "https://github.com/TKasperczyk/codex-mcp-swarm/issues"
 
 [project.scripts]
-codex-mcp-swarm = "codex_mcp_swarm:main"
+codex-mcp-swarm-http = "codex_swarm_http:main"
 
 [tool.setuptools]
-py-modules = ["codex_mcp_swarm"]
+py-modules = ["codex_mcp_swarm", "codex_swarm_http"]

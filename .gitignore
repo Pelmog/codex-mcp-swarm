@@ -4,3 +4,5 @@ __pycache__/
 dist/
 build/
 .claude/
+__pycache__/
+.venv/
